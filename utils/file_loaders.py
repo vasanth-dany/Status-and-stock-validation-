@@ -1,3 +1,4 @@
+# VERSION: v14 - Shopee MP Status fix
 import io
 import re
 import zipfile
@@ -25,8 +26,13 @@ def _read_file(file, header_row=0, skiprows=None):
         if name.endswith(".csv"):
             return pd.read_csv(io.BytesIO(raw), header=header_row,
                                skiprows=skiprows, dtype=str)
-        return pd.read_excel(io.BytesIO(raw), header=header_row,
-                             skiprows=skiprows, dtype=str)
+        try:
+            import python_calamine
+            return pd.read_excel(io.BytesIO(raw), header=header_row,
+                                 skiprows=skiprows, dtype=str, engine="calamine")
+        except ImportError:
+            return pd.read_excel(io.BytesIO(raw), header=header_row,
+                                 skiprows=skiprows, dtype=str)
     except Exception:
         return pd.DataFrame()
 
@@ -41,13 +47,18 @@ def _read_zip(file, header_row=0, skiprows=None):
                 with zf.open(name) as f:
                     data = f.read()
                     try:
-                        if name.lower().endswith(".csv"):
-                            df = pd.read_csv(io.BytesIO(data), header=header_row,
-                                             skiprows=skiprows, dtype=str)
-                        else:
-                            df = pd.read_excel(io.BytesIO(data), header=header_row,
-                                               skiprows=skiprows, dtype=str)
-                        frames.append(df)
+                         if name.lower().endswith(".csv"):
+                             df = pd.read_csv(io.BytesIO(data), header=header_row,
+                                              skiprows=skiprows, dtype=str)
+                         else:
+                             try:
+                                 import python_calamine
+                                 df = pd.read_excel(io.BytesIO(data), header=header_row,
+                                                    skiprows=skiprows, dtype=str, engine="calamine")
+                             except ImportError:
+                                 df = pd.read_excel(io.BytesIO(data), header=header_row,
+                                                    skiprows=skiprows, dtype=str)
+                         frames.append(df)
                     except Exception:
                         continue
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -80,8 +91,13 @@ def _filter_13digit_skus(df, sku_col):
 
 
 def _ecom_status_from_val(val, future_launch):
+    """
+    Yes -> Active
+    Future launch date -> Inactive (No Future launch)
+    No / OFF / #N/A / blank -> Inactive
+    """
     if bool(future_launch):
-        return "Inactive"
+        return "Inactive (No Future launch)"
     s = _safe_str(val).upper()
     if s in ("YES", "Y"):
         return "Active"
@@ -114,32 +130,6 @@ def load_lazada(file, country):
 
 # ── Shopee ────────────────────────────────────────────────────────────────────
 
-def _load_shopee_raw(file):
-    if file is None:
-        return pd.DataFrame()
-    is_zip = file.name.lower().endswith(".zip")
-    if is_zip:
-        for hr in [2, 1, 0]:
-            df = _read_zip(file, header_row=hr)
-            file.seek(0)
-            if not df.empty:
-                df = _normalise_cols(df)
-                cols_lower = [c.lower() for c in df.columns]
-                if any("sku" in c or "product" in c for c in cols_lower):
-                    if len(df) > 3:
-                        df = df.iloc[3:].reset_index(drop=True)
-                    return df
-        return pd.DataFrame()
-    else:
-        df = _read_file(file, header_row=2)
-        if df.empty:
-            return pd.DataFrame()
-        df = _normalise_cols(df)
-        if len(df) > 3:
-            df = df.iloc[3:].reset_index(drop=True)
-        return df
-
-
 def _find_sku_col(df):
     for c in ["SKU", "Parent SKU", "Seller SKU", "SellerSKU", "ParentSKU"]:
         if c in df.columns:
@@ -160,18 +150,194 @@ def _find_pid_col(df):
     return None
 
 
+def _parse_shopee_single(raw_bytes, filename_lower):
+    """
+    Parse one Shopee export file.
+
+    Confirmed Shopee export structure (from real files):
+      Row 0: internal keys  (et_title_product_id ...)
+      Row 1: metadata
+      Row 2: REAL HEADER    (Product ID, Parent SKU, SKU, Stock ...)
+      Row 3: Mandatory instruction row  -> skip
+      Row 4: blank                      -> skip
+      Row 5: validation note            -> skip
+      Row 6+: actual data
+
+    Engine priority:
+      1. calamine  (handles Shopee conditional formatting — install python-calamine)
+      2. openpyxl  (fallback, may warn but usually works)
+      3. xlrd      (last resort for older xlsx)
+    """
+    import warnings
+
+    if filename_lower.endswith(".csv"):
+        try:
+            df = pd.read_csv(io.BytesIO(raw_bytes), header=2, dtype=str)
+            df = _normalise_cols(df)
+            df = df.iloc[3:].reset_index(drop=True)
+            df = df.dropna(how="all").reset_index(drop=True)
+            return df
+        except Exception:
+            return pd.DataFrame()
+
+    # Build engine list — calamine first
+    engines = []
+    try:
+        import python_calamine  # noqa
+        engines.append("calamine")
+    except ImportError:
+        pass
+    engines.append("openpyxl")
+
+    for engine in engines:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                df = pd.read_excel(
+                    io.BytesIO(raw_bytes),
+                    header=2,
+                    dtype=str,
+                    engine=engine,
+                )
+            if df is None or df.empty:
+                continue
+            df = _normalise_cols(df)
+            # Skip first 3 rows after header (instruction/blank rows)
+            if len(df) > 3:
+                df = df.iloc[3:].reset_index(drop=True)
+            df = df.dropna(how="all").reset_index(drop=True)
+            # Must have at least SKU or Product columns to be valid
+            cols_lower = [c.lower() for c in df.columns]
+            if (any("sku" in c for c in cols_lower) or
+                    any("product" in c for c in cols_lower)):
+                if len(df) > 0:
+                    return df
+        except Exception:
+            continue
+
+    # Last resort: try reading with openpyxl ignoring all validation
+    try:
+        import openpyxl
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            wb = openpyxl.load_workbook(
+                io.BytesIO(raw_bytes), data_only=True, read_only=True
+            )
+            ws = wb.active
+            rows_data = []
+            for row in ws.iter_rows(values_only=True):
+                rows_data.append(list(row))
+            wb.close()
+        if len(rows_data) < 7:
+            return pd.DataFrame()
+        # Row index 2 = header
+        header = [str(v).strip() if v is not None else "" for v in rows_data[2]]
+        data_rows = rows_data[6:]  # skip rows 3,4,5
+        df = pd.DataFrame(data_rows, columns=header)
+        df = df.astype(str)
+        df = df.replace("None", "")
+        df = _normalise_cols(df)
+        df = df.dropna(how="all").reset_index(drop=True)
+        cols_lower = [c.lower() for c in df.columns]
+        if (any("sku" in c for c in cols_lower) or
+                any("product" in c for c in cols_lower)):
+            return df
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+
+def _load_shopee_raw(file):
+    """
+    Load Shopee file — supports:
+    - ZIP containing multiple xlsx files (reads ALL, consolidates)
+    - Single xlsx or csv file
+    Returns one consolidated DataFrame.
+    """
+    if file is None:
+        return pd.DataFrame()
+
+    name = file.name.lower()
+    raw  = file.read()
+    file.seek(0)
+
+    if name.endswith(".zip"):
+        frames = []
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                for entry in sorted(zf.namelist()):
+                    if entry.lower().endswith((".xlsx", ".xls", ".csv")):
+                        with zf.open(entry) as f:
+                            entry_bytes = f.read()
+                        df = _parse_shopee_single(entry_bytes, entry.lower())
+                        if not df.empty:
+                            frames.append(df)
+        except Exception:
+            return pd.DataFrame()
+        if not frames:
+            return pd.DataFrame()
+        combined = pd.concat(frames, ignore_index=True)
+        return _normalise_cols(combined)
+    else:
+        return _parse_shopee_single(raw, name)
+
+
 def load_shopee_stock(file, country):
+    """
+    Load Shopee stock file (ZIP containing multiple xlsx files, or single file).
+
+    Column logic (confirmed from real Shopee export structure):
+      Row 2 (index 2) = real header:
+        Product ID  | Parent SKU   | SKU           | Stock
+        58158713196 | 404620_07    | 4069161482557 | 10     <- child row
+        58158713196 | (blank)      | 4069161482595 | 12     <- child row
+
+    SKU resolution:
+      1. Use "SKU" column (child 13-digit barcode) if present and non-blank
+      2. If "SKU" is blank, fall back to "Parent SKU" column value
+      3. Keep only rows where resolved SKU is exactly 13 digits
+      4. Drop all other rows (non-13-digit = invalid)
+
+    ZIP handling: all xlsx files inside ZIP are consolidated into one DataFrame.
+    """
     df = _load_shopee_raw(file)
     if df.empty:
         return pd.DataFrame()
-    sku_col = _find_sku_col(df)
-    if sku_col is None:
-        return pd.DataFrame()
-    if sku_col != "SKU":
-        df = df.rename(columns={sku_col: "SKU"})
+
+    # ── Find Product ID column ──────────────────────────────────────────────
     pid_col = _find_pid_col(df)
     if pid_col and pid_col != "Product ID":
         df = df.rename(columns={pid_col: "Product ID"})
+
+    # ── Find SKU column (child barcode) ─────────────────────────────────────
+    # Priority: "SKU" > "Variation SKU" > other sku-like columns
+    # Do NOT use "Parent SKU" as the primary SKU column
+    sku_col = None
+    for c in ["SKU", "Variation SKU", "VariationSKU"]:
+        if c in df.columns:
+            sku_col = c
+            break
+    if sku_col is None:
+        for c in df.columns:
+            cl = c.lower()
+            if "sku" in cl and "parent" not in cl:
+                sku_col = c
+                break
+
+    # ── Find Parent SKU column ───────────────────────────────────────────────
+    parent_col = None
+    for c in ["Parent SKU", "ParentSKU", "parent_sku", "parent sku"]:
+        if c in df.columns:
+            parent_col = c
+            break
+    if parent_col is None:
+        for c in df.columns:
+            if "parent" in c.lower() and "sku" in c.lower():
+                parent_col = c
+                break
+
+    # ── Find Stock column ────────────────────────────────────────────────────
     stock_col = None
     for c in ["Stock", "MP Stock", "Available Stock", "Current Stock", "Quantity"]:
         if c in df.columns:
@@ -182,9 +348,31 @@ def load_shopee_stock(file, country):
             if "stock" in c.lower() or "qty" in c.lower() or "quantity" in c.lower():
                 stock_col = c
                 break
+
+    # ── Build effective SKU: child first, fallback to Parent SKU ─────────────
+    if sku_col:
+        df["SKU"] = df[sku_col].apply(_clean_sku)
+    else:
+        df["SKU"] = ""
+
+    if parent_col:
+        # Where SKU is blank, fill from Parent SKU
+        mask_blank = df["SKU"] == ""
+        df.loc[mask_blank, "SKU"] = (
+            df.loc[mask_blank, parent_col].apply(_clean_sku)
+        )
+
+    # ── Keep only 13-digit SKUs ──────────────────────────────────────────────
+    df = df[df["SKU"].str.fullmatch(r"\d{13}", na=False)].copy()
+    df = df.reset_index(drop=True)
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # ── Rename stock column ───────────────────────────────────────────────────
     if stock_col and stock_col != "MP Stock":
         df = df.rename(columns={stock_col: "MP Stock"})
-    df = _filter_13digit_skus(df, "SKU")
+
     df["Marketplace"] = "Shopee " + country
     if "MP Stock" in df.columns:
         df["MP Stock"] = pd.to_numeric(
@@ -192,35 +380,90 @@ def load_shopee_stock(file, country):
         ).fillna(0)
     else:
         df["MP Stock"] = 0.0
+
     return df
 
 
 def load_shopee_status(file, country):
+    """
+    Load Shopee status/basic_info file.
+    Structure same as stock file:
+      Row 0: internal keys
+      Row 1: metadata
+      Row 2: REAL HEADER (Product ID, Parent SKU, Product Name ...)
+      Rows 3-5: skip
+      Row 6+: actual data
+
+    MP Status logic:
+      Product ID present (non-empty) -> Active
+      Product ID missing/blank       -> Inactive
+    """
     df = _load_shopee_raw(file)
     if df.empty:
         return pd.DataFrame()
-    pid_cols = [c for c in df.columns
-                if "product" in c.lower() and "id" in c.lower()]
-    if pid_cols:
-        df["Product ID"] = df[pid_cols[0]].apply(_clean_sku)
+
+    # Find Product ID column
+    pid_col = _find_pid_col(df)
+    if pid_col:
+        if pid_col != "Product ID":
+            df = df.rename(columns={pid_col: "Product ID"})
+        df["Product ID"] = df["Product ID"].apply(_safe_str)
     else:
         df["Product ID"] = ""
-    if "MP Status" in df.columns:
-        df["MP Status"] = df["MP Status"].apply(_safe_str)
-    else:
-        df["MP Status"] = df["Product ID"].apply(
-            lambda x: "Active" if _safe_str(x) not in ("", "nan") else "Inactive"
-        )
-    sku_col = _find_sku_col(df)
+
+    # Derive MP Status from Product ID presence
+    df["MP Status"] = df["Product ID"].apply(
+        lambda x: "Active" if _safe_str(x) not in ("", "nan", "none") else "Inactive"
+    )
+
+    # Find SKU column (13-digit barcode) — may not exist in basic_info file
+    sku_col = None
+    for c in ["SKU", "Variation SKU", "Seller SKU"]:
+        if c in df.columns:
+            sku_col = c
+            break
+    if sku_col is None:
+        for c in df.columns:
+            if "sku" in c.lower() and "parent" not in c.lower():
+                sku_col = c
+                break
+
     if sku_col and sku_col != "SKU":
         df = df.rename(columns={sku_col: "SKU"})
+
+    # Find Parent SKU column
+    parent_col = None
+    for c in ["Parent SKU", "ParentSKU", "parent_sku", "parent sku"]:
+        if c in df.columns:
+            parent_col = c
+            break
+    if parent_col is None:
+        for c in df.columns:
+            if "parent" in c.lower() and "sku" in c.lower():
+                parent_col = c
+                break
+
+    # Only apply 13-digit filter if SKU column exists and has 13-digit values
     if "SKU" in df.columns:
-        df = _filter_13digit_skus(df, "SKU")
+        df["SKU"] = df["SKU"].apply(_clean_sku)
+        
+        # Fallback to Parent SKU where SKU is blank (same as stock loader logic)
+        if parent_col:
+            mask_blank = df["SKU"] == ""
+            df.loc[mask_blank, "SKU"] = (
+                df.loc[mask_blank, parent_col].apply(_clean_sku)
+            )
+            
+        has_13 = df["SKU"].str.fullmatch(r'\d{13}', na=False).any()
+        if has_13:
+            df = df[df["SKU"].str.fullmatch(r'\d{13}', na=False)].copy()
+    else:
+        # No SKU column — use Product ID as identifier for status merge
+        df["SKU"] = ""
+
     df["Marketplace"] = "Shopee " + country
-    return df
+    return df.reset_index(drop=True)
 
-
-# ── Zalora ────────────────────────────────────────────────────────────────────
 
 def load_zalora_stock(file, country):
     if file is None:
@@ -297,10 +540,6 @@ def load_zalora_status(file, country):
         df = df.rename(columns={status_col: "MP Status"})
     if "MP Status" in df.columns:
         df["MP Status"] = df["MP Status"].apply(_safe_str).str.strip().str.capitalize()
-        df["MP Status"] = df["MP Status"].replace({
-            "Active": "Active", "Inactive": "Inactive",
-            "1": "Active", "0": "Inactive",
-        })
     else:
         df["MP Status"] = "Unknown"
     df["SKU"] = df["SKU"].apply(_clean_sku)
@@ -309,6 +548,7 @@ def load_zalora_status(file, country):
 
 
 # ── TikTok MY ─────────────────────────────────────────────────────────────────
+# First 2 rows ignored, row 3 = header (index 2), rows 4-5 ignored
 
 def _load_tiktok_raw(file):
     if file is None:
@@ -351,8 +591,7 @@ def _load_tiktok_file(file, status_label):
                 pid_col = c
                 break
     qty_col = None
-    for c in ["Quantity", "Stock", "quantity", "stock",
-               "Available Stock", "Available Qty"]:
+    for c in ["Quantity", "Stock", "quantity", "stock", "Available Stock"]:
         if c in df.columns:
             qty_col = c
             break
@@ -421,68 +660,117 @@ def load_content(file):
 
 
 # ── TC Inventory ──────────────────────────────────────────────────────────────
+# Child SKU (GED1708197-01) takes priority over Parent SKU (GED1708197)
+# Also returns TC SKU column as-is for output report
 
 def load_tc_inventory(file):
+    """
+    TC Inventory column layout (from screenshot):
+      Column 1 = Custom SKU  (13-digit barcode e.g. 4067983507151) -> used as SKU key
+      Column 2 = SKU         (GED code e.g. GED4771311-01)         -> TC SKU for output
+      Other    = Item status, Max Quantity, etc.
+
+    Child/Parent priority:
+      Child  = SKU contains "-"  e.g. GED4771311-01
+      Parent = SKU without  "-"  e.g. GED4771311
+      If a Custom SKU maps to both a child and parent entry,
+      the child entry is preferred.
+    """
     if file is None:
         return pd.DataFrame()
-    df = pd.DataFrame()
     raw  = file.read()
     name = file.name.lower()
     file.seek(0)
-    for header_row in [0, 1, 2]:
-        try:
-            if name.endswith(".csv"):
-                tmp = pd.read_csv(io.BytesIO(raw), header=header_row, dtype=str)
-            else:
-                tmp = pd.read_excel(io.BytesIO(raw), header=header_row, dtype=str)
-            if len(tmp.columns) > 2:
-                df = tmp
-                break
-        except Exception:
-            continue
-    if df.empty:
+    try:
+        if name.endswith(".csv"):
+            raw_df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
+        else:
+            try:
+                import python_calamine
+                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str, engine="calamine")
+            except ImportError:
+                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str)
+    except Exception:
         return pd.DataFrame()
-    df.columns = [_safe_str(c) for c in df.columns]
+
+    if raw_df.empty:
+        return pd.DataFrame()
+
+    header_idx = 0
+    for i in range(min(5, len(raw_df))):
+        row_vals = [_safe_str(x) for x in raw_df.iloc[i]]
+        row_lower = [v.lower() for v in row_vals]
+        if any(h in row_lower for h in ["custom sku", "customsku", "barcode", "ean", "sku", "item status", "status"]):
+            header_idx = i
+            break
+        non_empty = sum(1 for v in row_vals if v != "")
+        if non_empty > 2 and header_idx == 0:
+            header_idx = i
+
+    df = raw_df.iloc[header_idx + 1:].copy()
+    df.columns = [_safe_str(x) for x in raw_df.iloc[header_idx]]
     df = df.loc[:, ~df.columns.duplicated()].copy()
     df = df.reset_index(drop=True)
     actual_cols = list(df.columns)
-    sku_col = None
-    for c in ["Custom SKU", "SKU", "SellerSKU", "Seller SKU", "EAN", "Barcode"]:
+
+    # ── Column 1: Custom SKU (barcode) — used as the lookup key ──────────────
+    # This is always the first column
+    custom_sku_col = None
+    for c in ["Custom SKU", "CustomSKU", "Barcode", "EAN"]:
         if c in actual_cols:
-            sku_col = c
+            custom_sku_col = c
             break
-    if sku_col is None:
-        for c in actual_cols:
-            if "sku" in c.lower() or "code" in c.lower():
-                sku_col = c
-                break
-    if sku_col is None and actual_cols:
-        sku_col = actual_cols[0]
+    if custom_sku_col is None:
+        # Fall back to first column
+        custom_sku_col = actual_cols[0] if actual_cols else None
+
+    # ── Column 2: SKU (GED code) — shown in output as TC SKU ─────────────────
+    # This is always the second column (the GED parent/child code)
+    ged_sku_col = None
+    for c in ["SKU", "Sku", "sku"]:
+        if c in actual_cols and c != custom_sku_col:
+            ged_sku_col = c
+            break
+    if ged_sku_col is None:
+        # Fall back to second column
+        if len(actual_cols) > 1:
+            ged_sku_col = actual_cols[1]
+        else:
+            ged_sku_col = custom_sku_col
+
+    # ── Status column ─────────────────────────────────────────────────────────
     status_col = None
-    for c in ["Item status", "Item Status", "Status", "TC Status", "ItemStatus"]:
+    for c in ["Item status", "Item Status", "Status", "TC Status",
+               "ItemStatus", "item status"]:
         if c in actual_cols:
             status_col = c
             break
     if status_col is None:
         for c in actual_cols:
-            if "status" in c.lower() and c != sku_col:
+            if "status" in c.lower() and c not in (custom_sku_col, ged_sku_col):
                 status_col = c
                 break
+
+    # ── Max Quantity column ───────────────────────────────────────────────────
     max_col = None
-    for c in ["Max Quantity", "MaxQuantity", "Max", "Maximum Quantity", "max_quantity"]:
+    for c in ["Max Quantity", "MaxQuantity", "Max", "Maximum Quantity",
+               "max_quantity", "max quantity"]:
         if c in actual_cols:
             max_col = c
             break
     if max_col is None:
         for c in actual_cols:
-            if "max" in c.lower() and c not in (sku_col, status_col):
+            if "max" in c.lower() and c not in (custom_sku_col, ged_sku_col, status_col):
                 max_col = c
                 break
+
+    # ── Build output DataFrame ────────────────────────────────────────────────
     out = pd.DataFrame()
-    out["SKU"] = df[sku_col].apply(_clean_sku) if sku_col else ""
-    out["TC Status"] = (
-        df[status_col].apply(_safe_str) if status_col else "Unknown"
-    )
+    # SKU = Custom SKU (barcode) used as join key with marketplace files
+    out["SKU"]       = df[custom_sku_col].apply(_clean_sku) if custom_sku_col else ""
+    # TC SKU = GED code from second column, shown in output report
+    out["TC SKU"]    = df[ged_sku_col].apply(_safe_str) if ged_sku_col else ""
+    out["TC Status"] = df[status_col].apply(_safe_str) if status_col else "Unknown"
     if max_col:
         out["Max Quantity"] = df[max_col].apply(_safe_str)
         out["Max 0"] = out["Max Quantity"].apply(
@@ -490,263 +778,277 @@ def load_tc_inventory(file):
         )
     else:
         out["Max Quantity"] = ""
-        out["Max 0"] = "No"
-    return out[out["SKU"] != ""].reset_index(drop=True)
+        out["Max 0"]        = "No"
+
+    out = out[out["SKU"] != ""].copy()
+
+    # ── Child/Parent deduplication ────────────────────────────────────────────
+    # If same Custom SKU (barcode) maps to both a child GED code (with "-")
+    # and a parent GED code (without "-"), keep the child entry.
+    out["_is_child"] = out["TC SKU"].str.contains("-", na=False).astype(int)
+    out = out.sort_values("_is_child", ascending=False)  # child first
+    out = out.drop_duplicates(subset=["SKU"], keep="first")
+    out = out.drop(columns=["_is_child"])
+    out = out.reset_index(drop=True)
+
+    return out
 
 
 # ── zEcom ─────────────────────────────────────────────────────────────────────
-#
-# File structures (confirmed from actual files):
-#
-# PH  — single sheet "PH", header on ROW 3 (0-indexed=2)
-#        Article col  : "PIM Article#"
-#        Launch col   : "Launch Dates"
-#        Channel cols : "LAZADA", "SHOPEE", "ZALORA", "TIK TOK"   (YES/NO)
-#
-# MY  — sheet "MY" inside combined MY+SG file, header on ROW 4 (0-indexed=3)
-#        Article col  : "Style#"
-#        Launch col   : "Launch Dates"
-#        Channel cols : "Lazada", "Shopee", "Zalora MP", "TIKTOK"  (YES/NO)
-#
-# SG  — sheet "SG" inside combined MY+SG file, header on ROW 4 (0-indexed=3)
-#        Article col  : "STYLE#"
-#        Launch col   : "Launch Dates"
-#        Channel cols : "Lazada", "Shopee", "Zalora"              (YES/NO)
-#        (no TikTok column in SG)
-#
-# Channel values are YES / NO (case-insensitive).
-# Future-launch detection: Launch Date > today → channel treated as Inactive.
-
-# Per-country config — single source of truth
-_ZECOM_CONFIG = {
-    "PH": {
-        "sheet":        "PH",
-        "header_row":   2,          # 0-indexed row number for pd.read_excel
-        "article_cols": ["PIM Article#", "PIM Article #"],
-        "launch_cols":  ["Launch Dates", "Launch Date"],
-        "channels": {               # canonical name → possible column names
-            "Ecom_Lazada":  ["LAZADA", "Lazada"],
-            "Ecom_Shopee":  ["SHOPEE", "Shopee"],
-            "Ecom_Zalora":  ["ZALORA", "Zalora", "Zalora MP"],
-            "Ecom_TikTok":  ["TIK TOK", "TIKTOK", "TikTok", "Tik Tok"],
-        },
-    },
-    "MY": {
-        "sheet":        "MY",
-        "header_row":   3,
-        "article_cols": ["Style#", "STYLE#"],
-        "launch_cols":  ["Launch Dates", "Launch Date"],
-        "channels": {
-            "Ecom_Lazada":  ["Lazada", "LAZADA"],
-            "Ecom_Shopee":  ["Shopee", "SHOPEE"],
-            "Ecom_Zalora":  ["Zalora MP", "Zalora", "ZALORA"],
-            "Ecom_TikTok":  ["TIKTOK", "TIK TOK", "TikTok"],
-        },
-    },
-    "SG": {
-        "sheet":        "SG",
-        "header_row":   3,
-        "article_cols": ["STYLE#", "Style#"],
-        "launch_cols":  ["Launch Dates", "Launch Date"],
-        "channels": {
-            "Ecom_Lazada":  ["Lazada", "LAZADA"],
-            "Ecom_Shopee":  ["Shopee", "SHOPEE"],
-            "Ecom_Zalora":  ["Zalora", "ZALORA", "Zalora MP"],
-            # SG has no TikTok — intentionally omitted
-        },
-    },
-}
-
-
-def _yes_no_to_status(val, future_launch):
-    """Convert YES/NO cell value to 'Active'/'Inactive', respecting future launch."""
-    if bool(future_launch):
-        return "Inactive"
-    s = _safe_str(val).strip().upper()
-    return "Active" if s in ("YES", "Y", "1") else "Inactive"
-
+# PH  -> Article No column = "PIM Article#", header row 3 (index 2)
+# MY  -> Article No column = "Style#",       header row 4 (index 3)
+# SG  -> Article No column = "STYLE#",       header row 4 (index 3)
 
 def load_zecom(file, country="PH"):
-    """
-    Load the zEcom channel tracking file for a given country.
-
-    PH  → single-sheet xlsx (sheet "PH")
-    MY  → combined MY+SG xlsx, reads sheet "MY"
-    SG  → combined MY+SG xlsx, reads sheet "SG"
-
-    Returns a DataFrame with columns:
-        Article No, Launch Date, Future Launch,
-        Ecom_Lazada, Ecom_Shopee, Ecom_Zalora[, Ecom_TikTok]
-    """
     if file is None:
         return pd.DataFrame()
-
-    cfg = _ZECOM_CONFIG.get(country, _ZECOM_CONFIG["PH"])
-
     raw  = file.read()
     name = file.name.lower()
     file.seek(0)
 
-    # ── 1. Load the correct sheet ────────────────────────────────────────────
-    sheet_name  = cfg["sheet"]
-    header_row  = cfg["header_row"]
+    article_col_by_country = {
+        "PH": ["PIM Article#", "PIM Article #", "Article No", "ArticleNo"],
+        "MY": ["Style#", "STYLE#", "style#", "Article No", "PIM Article#"],
+        "SG": ["STYLE#", "Style#", "style#", "Article No", "PIM Article#"],
+    }
+    preferred_article_cols = article_col_by_country.get(country, ["Article No"])
+    preferred_rows = [2, 1, 0, 3] if country == "PH" else [3, 2, 1, 0]
 
     try:
         if name.endswith(".csv"):
-            # CSV: no sheets, just read with the right header row
-            df = pd.read_csv(
-                io.BytesIO(raw), header=header_row, dtype=str
-            )
+            raw_df = pd.read_csv(io.BytesIO(raw), header=None, dtype=str)
         else:
-            # Try the configured sheet name first; fall back to active sheet
             try:
-                df = pd.read_excel(
-                    io.BytesIO(raw),
-                    sheet_name=sheet_name,
-                    header=header_row,
-                    dtype=str,
-                )
-            except Exception:
-                df = pd.read_excel(
-                    io.BytesIO(raw),
-                    sheet_name=0,
-                    header=header_row,
-                    dtype=str,
-                )
-    except Exception as e:
+                import python_calamine
+                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str, engine="calamine")
+            except ImportError:
+                raw_df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str)
+    except Exception:
         return pd.DataFrame()
 
-    if df is None or df.empty:
+    if raw_df.empty:
         return pd.DataFrame()
 
-    # ── 2. Normalise column names (strip whitespace and newlines) ────────────
-    df.columns = [
-        " ".join(_safe_str(c).split())   # collapse internal whitespace/newlines
-        for c in df.columns
-    ]
-
-    # ── 3. Drop fully-empty rows and duplicate columns ───────────────────────
-    df = df.dropna(how="all").reset_index(drop=True)
-    df = df.loc[:, ~df.columns.duplicated()].copy()
-
-    # ── 4. Locate and rename the Article No column ───────────────────────────
-    article_col = None
-    for candidate in cfg["article_cols"]:
-        if candidate in df.columns:
-            article_col = candidate
-            break
-    if article_col is None:
-        # Fuzzy fallback — look for any column containing "style", "article", or "pim"
-        for c in df.columns:
-            cl = c.lower()
-            if "style" in cl or "pim article" in cl or "article#" in cl:
-                article_col = c
+    header_idx = None
+    for r_idx in preferred_rows:
+        if r_idx < len(raw_df):
+            row_vals = [_safe_str(x) for x in raw_df.iloc[r_idx]]
+            row_lower = [v.lower() for v in row_vals]
+            expected  = [c.lower() for c in preferred_article_cols]
+            if any(e in row_lower for e in expected) or any("article" in c or "pim" in c or "style" in c for c in row_lower):
+                header_idx = r_idx
                 break
-    if article_col is None:
-        return pd.DataFrame()
 
-    df = df.rename(columns={article_col: "Article No"})
-    df["Article No"] = df["Article No"].apply(_safe_str).str.strip()
-    # Drop rows where Article No is empty or looks like a header repeat
-    df = df[df["Article No"].str.len() > 0].copy()
-    df = df[~df["Article No"].str.lower().isin(
-        ["pim article#", "style#", "article no", "article#", "nan"]
-    )].copy()
+    if header_idx is None:
+        for r_idx in range(min(6, len(raw_df))):
+            row_vals = [_safe_str(x) for x in raw_df.iloc[r_idx]]
+            row_lower = [v.lower() for v in row_vals]
+            expected  = [c.lower() for c in preferred_article_cols]
+            if any(e in row_lower for e in expected) or any("article" in c or "pim" in c or "style" in c for c in row_lower):
+                header_idx = r_idx
+                break
+
+    if header_idx is None:
+        header_idx = preferred_rows[0] if preferred_rows[0] < len(raw_df) else 0
+
+    df = raw_df.iloc[header_idx + 1:].copy()
+    df.columns = [_safe_str(x) for x in raw_df.iloc[header_idx]]
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+    df = df.reset_index(drop=True)
+    first_col = df.columns[0]
+    # Drop rows where first column equals its own header text (duplicate header row)
+    df = df[df[first_col].apply(_safe_str) != first_col].copy()
     df = df.reset_index(drop=True)
 
-    # ── 5. Locate and parse the Launch Date column ───────────────────────────
+    # Rename Article No column
+    article_col = None
+    for c in preferred_article_cols:
+        if c in df.columns:
+            article_col = c
+            break
+    if article_col is None:
+        for c in df.columns:
+            if "style" in c.lower() or "article" in c.lower() or "pim" in c.lower():
+                article_col = c
+                break
+    if article_col and article_col != "Article No":
+        df = df.rename(columns={article_col: "Article No"})
+
+    # Drop rows with blank Article No (this is the real validity check —
+    # first column like "Line Type" can be blank on valid data rows)
+    if "Article No" in df.columns:
+        df = df[df["Article No"].apply(_safe_str) != ""].copy()
+        df = df.reset_index(drop=True)
+
+    # Rename Launch Date column
     launch_col = None
-    for candidate in cfg["launch_cols"]:
-        if candidate in df.columns:
-            launch_col = candidate
+    for c in ["Launch Dates", "Launch Date", "LaunchDate", "Launch"]:
+        if c in df.columns:
+            launch_col = c
             break
     if launch_col is None:
         for c in df.columns:
             if "launch" in c.lower():
                 launch_col = c
                 break
-
-    today = pd.Timestamp.today().normalize()
-    if launch_col:
+    if launch_col and launch_col != "Launch Date":
         df = df.rename(columns={launch_col: "Launch Date"})
+
+    # Future launch flag
+    today = pd.Timestamp.today().normalize()
+    if "Launch Date" in df.columns:
         df["Launch Date"] = pd.to_datetime(df["Launch Date"], errors="coerce")
         df["Future Launch"] = df["Launch Date"].apply(
-            lambda d: pd.notna(d) and d > today
-        )
-        # Format as readable date string (keep NaT as "")
-        df["Launch Date"] = df["Launch Date"].apply(
-            lambda d: str(d.date()) if pd.notna(d) else ""
+            lambda d: True if pd.notna(d) and d > today else False
         )
     else:
-        df["Launch Date"]   = ""
         df["Future Launch"] = False
 
-    # ── 6. Map channel columns to standardised Ecom_ names ──────────────────
-    for ecom_name, candidates in cfg["channels"].items():
-        matched_col = None
-        for candidate in candidates:
-            if candidate in df.columns:
-                matched_col = candidate
+    # Build standardised Ecom_ columns
+    mp_keywords = {
+        "lazada":  "Ecom_Lazada",
+        "shopee":  "Ecom_Shopee",
+        "zalora":  "Ecom_Zalora",
+        "tiktok":  "Ecom_TikTok",
+    }
+    for col in df.columns:
+        if col in ("Article No", "Launch Date", "Future Launch"):
+            continue
+        col_l = col.lower()
+        for mp_key, ecom_name in mp_keywords.items():
+            if mp_key in col_l and ecom_name not in df.columns:
+                df[ecom_name] = df.apply(
+                    lambda row, c=col: _ecom_status_from_val(
+                        row[c], row["Future Launch"]
+                    ),
+                    axis=1,
+                )
                 break
 
-        if matched_col is None:
-            # This channel is simply not present in this country's file (e.g. TikTok in SG)
-            df[ecom_name] = "Inactive"
-        else:
-            df[ecom_name] = df.apply(
-                lambda row, c=matched_col: _yes_no_to_status(
-                    row[c], row["Future Launch"]
-                ),
-                axis=1,
-            )
-
-    # ── 7. Return only the columns the rest of the app needs ─────────────────
-    keep_cols = (
-        ["Article No", "Launch Date", "Future Launch"]
-        + list(cfg["channels"].keys())
-    )
-    # Only keep columns that actually exist after the steps above
-    keep_cols = [c for c in keep_cols if c in df.columns]
-    return df[keep_cols].drop_duplicates("Article No").reset_index(drop=True)
+    return df
 
 
 # ── Exclusion List ────────────────────────────────────────────────────────────
 
+def _normalise_article_no(val):
+    """
+    Normalise Article No for matching across files.
+    Different files use different separators for the same code:
+      531103_03  /  531103-03  /  531103 03  /  53110303
+    Standardise to underscore format: keep digits/letters, replace
+    any of [' ', '-'] with '_', collapse multiple separators,
+    and strip leading/trailing whitespace. Also uppercase.
+    """
+    s = _safe_str(val)
+    if not s:
+        return ""
+    s = s.strip().upper()
+    # Replace common separators with underscore
+    s = re.sub(r'[\s\-]+', '_', s)
+    # Remove any trailing/leading underscores
+    s = s.strip('_')
+    return s
+
+
 def load_exclusion(file):
+    """
+    Load Exclusion list.
+
+    Supports two layouts:
+    1. Standard layout: a dedicated "Article No"/"Style#"/etc column
+       plus a separate "Status"/"Exclusion Status" column.
+    2. Combined layout (e.g. "Lazada Inactive", "Lazada Active",
+       "Shopee Inactive", "<Channel> <Status>"): the column header
+       itself encodes the status (Active/Inactive), and the column
+       values are the Article Nos for that status.
+
+    Article No is normalised for matching against zecom/content article numbers.
+    """
     if file is None:
         return pd.DataFrame()
     df = _read_file(file)
     if df.empty:
         return pd.DataFrame()
     df = _normalise_cols(df)
+
+    # ── Try standard layout first: explicit Article No + Status columns ──────
     art_col = None
-    for c in ["Article No", "ArticleNo", "Article Number", "STYLE#", "Style#"]:
+    for c in ["Article No", "ArticleNo", "Article Number",
+              "STYLE#", "Style#", "style#", "Style #", "STYLE #"]:
         if c in df.columns:
             art_col = c
             break
     if art_col is None:
         for c in df.columns:
-            if "article" in c.lower() or "style" in c.lower():
+            cl = c.lower()
+            if cl in ("article no", "articleno", "article number",
+                      "style#", "style #") or (
+                "article" in cl and "status" not in cl
+            ):
                 art_col = c
                 break
+
     status_col = None
-    for c in ["Status", "status", "Exclusion Status", "AM Status"]:
+    for c in ["Exclusion Status", "Status", "status", "AM Status",
+              "AM Request", "Action"]:
         if c in df.columns:
             status_col = c
             break
     if status_col is None:
         for c in df.columns:
-            if "status" in c.lower():
+            if "status" in c.lower() and c != art_col:
                 status_col = c
                 break
-    if art_col is None:
+
+    def _map_status(s):
+        s = _safe_str(s).strip().lower()
+        if s in ("active", "1", "yes", "y", "enable", "enabled"):
+            return "Active"
+        if s in ("inactive", "0", "no", "n", "disable", "disabled"):
+            return "Inactive"
+        return s.capitalize() if s else "Inactive"
+
+    rows = []
+
+    if art_col is not None and status_col is not None:
+        # ── Standard layout ────────────────────────────────────────────────
+        for _, r in df.iterrows():
+            art = _normalise_article_no(r.get(art_col, ""))
+            if art:
+                rows.append({
+                    "Article No": art,
+                    "Exclusion Status": _map_status(r.get(status_col, "")),
+                })
+    else:
+        # ── Combined layout: column header encodes the status ────────────────
+        # e.g. "Lazada Inactive", "Shopee Active", "Inactive", "Active"
+        for col in df.columns:
+            col_l = col.lower().strip()
+            inferred_status = None
+            if "inactive" in col_l:
+                inferred_status = "Inactive"
+            elif "active" in col_l:
+                inferred_status = "Active"
+
+            if inferred_status is None:
+                continue
+
+            for val in df[col]:
+                art = _normalise_article_no(val)
+                if art:
+                    rows.append({
+                        "Article No": art,
+                        "Exclusion Status": inferred_status,
+                    })
+
+    if not rows:
         return pd.DataFrame()
-    out = pd.DataFrame()
-    out["Article No"] = df[art_col].apply(_safe_str)
-    out["Exclusion Status"] = (
-        df[status_col].apply(_safe_str) if status_col else "Inactive"
-    )
-    return out[out["Article No"] != ""].reset_index(drop=True)
+
+    out = pd.DataFrame(rows)
+    out = out[out["Article No"] != ""].reset_index(drop=True)
+    # If duplicates, keep the last entry (most recent override)
+    out = out.drop_duplicates(subset=["Article No"], keep="last").reset_index(drop=True)
+    return out
 
 
 # ── ALL File ──────────────────────────────────────────────────────────────────
@@ -759,9 +1061,9 @@ def load_all_file(file, country):
         return pd.DataFrame()
     df = _normalise_cols(df)
     stock_col_map = {
-        "SG": ("MyStock-YCH-SG quantity",   "MyStock-YCH-SG reservedQuantity"),
-        "MY": ("MyStock-YCH-MY quantity",   "MyStock-YCH-MY reservedQuantity"),
-        "PH": ("MyStock-PH quantity",       "MyStock-PH reservedQuantity"),
+        "SG": ("MyStock-YCH-SG quantity",  "MyStock-YCH-SG reservedQuantity"),
+        "MY": ("MyStock-YCH-MY quantity",  "MyStock-YCH-MY reservedQuantity"),
+        "PH": ("MyStock-PH quantity",      "MyStock-PH reservedQuantity"),
     }
     stock_col, reserved_col = stock_col_map.get(country, ("", ""))
     for c in ["sellerSKU", "SellerSKU", "SKU", "Seller SKU"]:
@@ -810,24 +1112,47 @@ def load_all_files(
 
     shopee_stock  = load_shopee_stock(shopee_stock_file, country)
     shopee_status = load_shopee_status(shopee_status_file, country)
-    if not shopee_stock.empty and not shopee_status.empty:
-        merge_keys = [k for k in ["SKU", "Product ID"]
-                      if k in shopee_stock.columns and k in shopee_status.columns]
-        if merge_keys:
-            shopee = pd.merge(
-                shopee_stock,
-                shopee_status[merge_keys + ["MP Status"]].drop_duplicates(merge_keys),
-                on=merge_keys, how="left",
+
+    # MP Status logic:
+    # The status file contains the list of active Product IDs (one row per PID).
+    # If a Product ID from the stock file appears in the status file -> Active
+    # If a Product ID is NOT in the status file -> Inactive
+    # If Product ID is blank in stock file -> Inactive
+    # This is more reliable than merging since Product IDs may differ across files.
+
+    if not shopee_stock.empty:
+        shopee = shopee_stock.copy()
+
+        # Build set of active Product IDs from status file
+        active_pids = set()
+        if not shopee_status.empty and "Product ID" in shopee_status.columns:
+            active_pids = set(
+                shopee_status["Product ID"]
+                .apply(_safe_str)
+                .str.strip()
+                .replace("", pd.NA)
+                .dropna()
+                .unique()
             )
+
+        if "Product ID" in shopee.columns:
+            if active_pids and len(active_pids & set(shopee["Product ID"].apply(_safe_str).str.strip())) > 0:
+                # Status file PIDs overlap with stock file PIDs
+                # Use status file as authoritative Active PID list
+                shopee["MP Status"] = shopee["Product ID"].apply(
+                    lambda x: "Active" if _safe_str(x).strip() in active_pids else "Inactive"
+                )
+            else:
+                # No overlap between status file PIDs and stock file PIDs
+                # (different shops, or no status file uploaded)
+                # Rule: Active if this row's own Product ID is non-blank, else Inactive
+                shopee["MP Status"] = shopee["Product ID"].apply(
+                    lambda x: "Active" if _safe_str(x).strip() not in ("", "nan", "none") else "Inactive"
+                )
         else:
-            shopee = shopee_stock.copy()
-            shopee["MP Status"] = "Unknown"
-    elif not shopee_stock.empty:
-        shopee = shopee_stock
-        if "MP Status" not in shopee.columns:
-            shopee["MP Status"] = "Unknown"
+            shopee["MP Status"] = "Inactive"
     else:
-        shopee = shopee_status if not shopee_status.empty else pd.DataFrame()
+        shopee = pd.DataFrame()
     data["shopee"] = shopee
 
     zalora_stock  = load_zalora_stock(zalora_stock_file, country)
