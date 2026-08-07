@@ -209,24 +209,93 @@ def _build_excl_map(exclusion):
     return excl_map
 
 
-def _build_launch_map(zecom):
-    """Article No -> Launch Date string (YYYY-MM-DD)."""
-    launch_map = {}
+def _build_launch_map(zecom, mp_name):
     if zecom.empty or "Article No" not in zecom.columns:
-        return launch_map
-    if "Launch Date" not in zecom.columns:
-        return launch_map
-    for _, r in zecom.iterrows():
-        art = _normalise_article_no(r.get("Article No", ""))
-        if art:
-            ld = r.get("Launch Date", "")
-            if pd.notna(ld) and str(ld).strip() not in ("", "NaT", "nan"):
-                try:
-                    launch_map[art] = str(pd.to_datetime(ld).date())
-                except Exception:
-                    launch_map[art] = _safe_str(ld)
-            else:
-                launch_map[art] = ""
+        return {}
+        
+    mp_lower = mp_name.lower()
+    
+    # Normalize list of columns to map normalized name -> original name
+    norm_map = {}
+    for c in zecom.columns:
+        c_norm = str(c).lower().replace(" ", "").replace("\n", "").replace("&", "and").replace("_", "").replace("-", "")
+        norm_map[c_norm] = c
+
+    col_name = None
+    
+    # Candidates for Lazada & Shopee
+    if "lazada" in mp_lower or "shopee" in mp_lower:
+        laz_shp_candidates = [
+            "lazandshplaunchdate",
+            "lazadaandshopeelaunchdate",
+            "lazadaandshopeelaunchdates",
+            "shopeeandlazadalaunchdate",
+            "shopeeandlazadalaunchdates",
+            "lazandshplaunchdates"
+        ]
+        for cand in laz_shp_candidates:
+            if cand in norm_map:
+                col_name = norm_map[cand]
+                break
+                
+    # Candidates for Zalora
+    elif "zalora" in mp_lower:
+        zal_candidates = [
+            "zalandtklaunchdate",
+            "tiktokandzaloralaunchdate",
+            "tiktokandzaloralaunchdates",
+            "zaloralaunchdate",
+            "zallaunchdate",
+            "zallaunchdates",
+            "zaloralaunchdates"
+        ]
+        for cand in zal_candidates:
+            if cand in norm_map:
+                col_name = norm_map[cand]
+                break
+                
+    # Candidates for TikTok
+    elif "tiktok" in mp_lower:
+        tk_candidates = [
+            "zalandtklaunchdate",
+            "tiktokandzaloralaunchdate",
+            "tiktokandzaloralaunchdates",
+            "tktklaunchdate",
+            "tktklaunchdates",
+            "tiktoklaunchdate",
+            "tiktoklaunchdates"
+        ]
+        for cand in tk_candidates:
+            if cand in norm_map:
+                col_name = norm_map[cand]
+                break
+
+    # General fallbacks
+    if not col_name:
+        for cand in ["launchdate", "launchdates"]:
+            if cand in norm_map:
+                col_name = norm_map[cand]
+                break
+                
+    # Substring fallbacks
+    if not col_name:
+        for c in zecom.columns:
+            c_lower = str(c).lower()
+            if "launch" in c_lower and "date" in c_lower:
+                col_name = c
+                break
+                
+    if not col_name:
+        return {}
+
+    arts = zecom["Article No"].tolist()
+    formatted_dates = pd.to_datetime(zecom[col_name], errors="coerce").dt.strftime("%Y-%m-%d").fillna("").tolist()
+
+    launch_map = {}
+    for art, formatted_ld in zip(arts, formatted_dates):
+        art_norm = _normalise_article_no(art)
+        if art_norm:
+            launch_map[art_norm] = formatted_ld
     return launch_map
 
 
@@ -244,7 +313,6 @@ def generate_status_report(data, country):
     article_map = _build_article_map(content)
     excl_map    = _build_excl_map(exclusion)
     tc_map      = _build_tc_map(tc_inv)
-    launch_map  = _build_launch_map(zecom)
 
     # Build mp_sources dynamically
     mp_sources = {}
@@ -267,6 +335,7 @@ def generate_status_report(data, country):
         apply_buffer = _needs_buffer(mp_name)
         ecom_map  = _build_ecom_map(zecom, mp_name)
         stock_map = _build_stock_map(all_df, apply_buffer)
+        launch_map = _build_launch_map(zecom, mp_name)
 
         for _, row in df.iterrows():
             sku = _safe_str(row.get("SKU", ""))
