@@ -263,30 +263,74 @@ def _build_launch_map(zecom, mp_name):
         return {}
         
     mp_lower = mp_name.lower()
-    candidates = []
-    if "lazada" in mp_lower or "shopee" in mp_lower:
-        candidates = ["LAZ & SHP Launch Date", "Lazada & Shopee Launch Dates"]
-    elif "zalora" in mp_lower:
-        candidates = ["Tiktok & Zalora Launch Dates", "ZAL Launch Date", "ZAL & TK Launch Date", "ZAL & TK\nLaunch Date"]
-    elif "tiktok" in mp_lower:
-        candidates = ["Tiktok & Zalora Launch Dates", "ZAL & TK Launch Date", "ZAL & TK\nLaunch Date", "TKTK Launch Date"]
-        
+    
+    # Normalize list of columns to map normalized name -> original name
+    norm_map = {}
+    for c in zecom.columns:
+        c_norm = str(c).lower().replace(" ", "").replace("\n", "").replace("&", "and").replace("_", "").replace("-", "")
+        norm_map[c_norm] = c
+
     col_name = None
-    for c in candidates:
-        if c in zecom.columns:
-            col_name = c
-            break
-            
-    if not col_name:
-        for c in ["Launch Date", "LaunchDate", "Launch_Date"]:
-            if c in zecom.columns:
-                col_name = c
+    
+    # Candidates for Lazada & Shopee
+    if "lazada" in mp_lower or "shopee" in mp_lower:
+        laz_shp_candidates = [
+            "lazandshplaunchdate",
+            "lazadaandshopeelaunchdate",
+            "lazadaandshopeelaunchdates",
+            "shopeeandlazadalaunchdate",
+            "shopeeandlazadalaunchdates",
+            "lazandshplaunchdates"
+        ]
+        for cand in laz_shp_candidates:
+            if cand in norm_map:
+                col_name = norm_map[cand]
                 break
                 
+    # Candidates for Zalora
+    elif "zalora" in mp_lower:
+        zal_candidates = [
+            "zalandtklaunchdate",
+            "tiktokandzaloralaunchdate",
+            "tiktokandzaloralaunchdates",
+            "zaloralaunchdate",
+            "zallaunchdate",
+            "zallaunchdates",
+            "zaloralaunchdates"
+        ]
+        for cand in zal_candidates:
+            if cand in norm_map:
+                col_name = norm_map[cand]
+                break
+                
+    # Candidates for TikTok
+    elif "tiktok" in mp_lower:
+        tk_candidates = [
+            "zalandtklaunchdate",
+            "tiktokandzaloralaunchdate",
+            "tiktokandzaloralaunchdates",
+            "tktklaunchdate",
+            "tktklaunchdates",
+            "tiktoklaunchdate",
+            "tiktoklaunchdates"
+        ]
+        for cand in tk_candidates:
+            if cand in norm_map:
+                col_name = norm_map[cand]
+                break
+
+    # General fallbacks
+    if not col_name:
+        for cand in ["launchdate", "launchdates"]:
+            if cand in norm_map:
+                col_name = norm_map[cand]
+                break
+                
+    # Substring fallbacks
     if not col_name:
         for c in zecom.columns:
-            c_norm = c.lower().replace(" ", "").replace("_", "").replace("-", "")
-            if "launchdate" in c_norm:
+            c_lower = str(c).lower()
+            if "launch" in c_lower and "date" in c_lower:
                 col_name = c
                 break
                 
