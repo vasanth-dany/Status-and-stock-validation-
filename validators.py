@@ -264,10 +264,21 @@ def _build_launch_map(zecom, mp_name):
         
     mp_lower = mp_name.lower()
     
-    # Normalize list of columns to map normalized name -> original name
+    # Normalize list of columns to map normalized name -> original name, excluding generic launch date columns
     norm_map = {}
     for c in zecom.columns:
-        c_norm = str(c).lower().replace(" ", "").replace("\n", "").replace("&", "and").replace("_", "").replace("-", "")
+        c_str = str(c).strip()
+        c_norm = c_str.lower().replace(" ", "").replace("\n", "").replace("&", "and").replace("_", "").replace("-", "")
+        
+        # Precise exclusions for generic "Launch Date(s)" and ".com Launch Dates" and "changes"
+        c_lower_stripped = c_str.lower()
+        if c_norm in ("launchdate", "launchdates"):
+            continue
+        if "changes" in c_lower_stripped:
+            continue
+        if ".com" in c_lower_stripped:
+            continue
+            
         norm_map[c_norm] = c
 
     col_name = None
@@ -319,16 +330,9 @@ def _build_launch_map(zecom, mp_name):
                 col_name = norm_map[cand]
                 break
 
-    # General fallbacks
+    # Substring fallbacks on the filtered columns only
     if not col_name:
-        for cand in ["launchdate", "launchdates"]:
-            if cand in norm_map:
-                col_name = norm_map[cand]
-                break
-                
-    # Substring fallbacks
-    if not col_name:
-        for c in zecom.columns:
+        for c in norm_map.values():
             c_lower = str(c).lower()
             if "launch" in c_lower and "date" in c_lower:
                 col_name = c
